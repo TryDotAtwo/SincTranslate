@@ -1,4 +1,4 @@
-﻿import pyaudio
+import pyaudio
 import grpc
 import requests
 import yandex.cloud.ai.stt.v3.stt_pb2 as stt_pb2
@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import jwt
 import threading
 import queue
+import g4f
 from datetime import datetime
 
 load_dotenv()
@@ -21,9 +22,8 @@ RATE = 16000
 SOURCE_LANG = "ru-RU"
 TARGET_LANG = "en-US"
 VOICE = "oksana"
-DEBUG_MODE = True
-FOLDER_ID = os.getenv("FolderID")
 
+FOLDER_ID = os.getenv("FolderID")
 if not FOLDER_ID:
     raise ValueError("Folder ID not found in environment variable 'FolderID'.")
 
@@ -60,11 +60,49 @@ channel = grpc.secure_channel('stt.api.cloud.yandex.net:443', grpc.ssl_channel_c
 stub = stt_service.RecognizerStub(channel)
 
 audio_queue = queue.Queue(maxsize=1000)
+
 text_processing_queue = queue.Queue()
 playback_queue = queue.Queue()
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+# --- Вспомогательная функция: удаление перекрывающегося префикса ---
+def remove_duplicate_prefix(previous, current):
+    """
+    Удаляет из `current` максимально длинный префикс, совпадающий с суффиксом `previous`.
+    """
+    max_len = min(len(previous), len(current))
+    for i in range(max_len, 0, -1):
+        if previous[-i:] == current[:i]:
+            return current[i:]
+    return current
+
+
+def split_sentences_with_llm(previous, current):
+    current_trimmed = remove_duplicate_prefix(previous, current)
+    prompt = f"""
+Ты — система, разбивающая транскрибированный текст с речи на законченные предложения с пунктуацией.
+Тебе даётся предыдущий буфер и текущий, соединённые в один текст.
+Не нужно дублировать предложения, которые уже были в предыдущем буфере.
+Если предложение оборвалось — просто игнорируй его, оно будет в следующем буфере.
+Верни только завершённые предложения, отделённые точками.
+Не повторяй предложения из предыдущего буфера.
+Не возвращай предложения, если они уже были полностью в предыдущем.
+
+Предыдущий буфер:
+{previous}
+
+Текущий буфер:
+{current_trimmed}
+
+Ответ:
+"""
+    response = g4f.ChatCompletion.create(
+        model=g4f.models.gpt_4,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.strip()
 
 def translate_text(text):
     headers = {
@@ -122,7 +160,7 @@ def text_processing_worker():
             break
         translated = translate_text(text)
         if translated:
-            log(f"Translated text: {translated[:100]}...")
+            log(f"Translated text: {translated}")
             audio_data = synthesize_speech(translated)
             if audio_data:
                 log("Adding audio to playback queue...")
@@ -134,16 +172,16 @@ def text_processing_worker():
         text_processing_queue.task_done()
     log("Text processing thread stopped")
 
+# --- КЛАСС ДЛЯ ПОТОКА РАСПОЗНАВАНИЯ ---
 class RecognitionThread:
-    def __init__(self, audio_chunks, chunk_index, name, debug_mode=False):
+    def __init__(self, audio_source_queue, name):
         self.name = name
-        self.audio_chunks = audio_chunks
-        self.chunk_index = chunk_index
-        self.full_text = []
+        self.audio_source_queue = audio_source_queue
+        self.audio_chunks = []
+        self.full_text = ""
         self.text_lock = threading.Lock()
+        self.last_sent_index = 0
         self.stop_flag = threading.Event()
-        self.debug_mode = debug_mode
-        self.last_text_time = time.time()
         self.thread = threading.Thread(target=self.worker, daemon=True)
         self.metadata = [
             ('authorization', f'Bearer {iam_token}'),
@@ -151,15 +189,16 @@ class RecognitionThread:
         ]
 
     def start(self):
-        log(f"{self.name}: Starting recognition thread at chunk index {self.chunk_index}")
+        log(f"{self.name}: Starting recognition thread")
         self.thread.start()
 
     def stop(self):
         self.stop_flag.set()
         self.thread.join()
         log(f"{self.name}: Recognition thread stopped")
-        if self.debug_mode:
-            log(f"{self.name}: All recognized text: {''.join(self.full_text)[:1000]}...")
+
+    def add_chunk(self, chunk):
+        self.audio_chunks.append(chunk)
 
     def worker(self):
         def generate_requests():
@@ -176,13 +215,13 @@ class RecognitionThread:
                 )
             )
             yield stt_pb2.StreamingRequest(session_options=opts)
+            idx = 0
             while not self.stop_flag.is_set():
-                with self.text_lock:
-                    if self.chunk_index >= len(self.audio_chunks):
-                        time.sleep(0.01)
-                        continue
-                    chunk = self.audio_chunks[self.chunk_index]
-                    self.chunk_index += 1
+                if idx >= len(self.audio_chunks):
+                    time.sleep(0.01)
+                    continue
+                chunk = self.audio_chunks[idx]
+                idx += 1
                 yield stt_pb2.StreamingRequest(chunk=stt_pb2.AudioChunk(data=chunk))
 
         try:
@@ -191,75 +230,87 @@ class RecognitionThread:
                 if self.stop_flag.is_set():
                     break
                 kind = response.WhichOneof("Event")
-                if kind == "final" and response.final.alternatives:
-                    text = response.final.alternatives[0].text
+                if kind == "partial" and response.partial.alternatives:
+                    text = response.partial.alternatives[0].text
                     with self.text_lock:
-                        if text:
-                            log(f"{self.name}: Final text received at chunk {self.chunk_index}: '{text[:100]}...'")
-                            self.full_text.append(text + " ")
-                            self.last_text_time = time.time()
-                            if self.debug_mode:
-                                log(f"{self.name}: Added final text to full_text: '{text[:100]}...'")
+                        self.full_text = text
         except grpc.RpcError as e:
             log(f"{self.name} gRPC error: {e.details()}, code: {e.code()}")
         except Exception as e:
             log(f"{self.name} Recognition error: {e}")
 
-    def get_new_text(self):
+    def get_new_text_chunk(self):
         with self.text_lock:
-            if not self.full_text:
-                return ""
-            # Concatenate texts received within a 2-second window to form complete sentences
-            current_time = time.time()
-            if current_time - self.last_text_time < 2:
-                return ""
-            new_text = "".join(self.full_text)
-            self.full_text = []
-            log(f"{self.name}: Sending new text at chunk {self.chunk_index}: '{new_text[:100]}...'")
-            return new_text
+            new_chunk = self.full_text[self.last_sent_index:]
+            self.last_sent_index = len(self.full_text)
+            return new_chunk
 
-def process_text_buffer(recog1, recog2, recog_debug=None):
-    last_sent_time = 0
+    def trim_prefix(self, prefix_len):
+        with self.text_lock:
+            self.full_text = self.full_text[prefix_len:]
+            self.last_sent_index = max(0, self.last_sent_index - prefix_len)
+
+# --- Вспомогательная функция для поиска максимального общего суффикса-префикса ---
+def longest_common_suffix_prefix(suffix_source, prefix_target):
+    max_len = min(len(suffix_source), len(prefix_target))
+    for length in range(max_len, 0, -1):
+        if suffix_source[-length:] == prefix_target[:length]:
+            return length
+    return 0
+
+
+def process_llm_buffer_dual(recog1: RecognitionThread, recog2: RecognitionThread):
+    last_sent_text = ""
     active_recog = recog1
     switched_to_recog2 = False
-    start_time = time.time()
-    recog2_ready = False
+
+    last_send_time = 0
 
     while True:
         time.sleep(0.5)
         now = time.time()
-        if now - last_sent_time < 5:  # Reduced to 5 seconds for faster processing
+        if now - last_send_time < 10:
+            continue  # ждем 10 секунд между отправками
+
+        new_text = active_recog.get_new_text_chunk()
+        if not new_text.strip():
             continue
 
-        new_text = active_recog.get_new_text()
-        if new_text.strip():
-            log(f"Processing final text from {active_recog.name}: '{new_text[:100]}...'")
-            text_processing_queue.put(new_text)
-            last_sent_time = now
+        cleaned_text = remove_duplicate_prefix(last_sent_text, last_sent_text + new_text)
 
-        elapsed = time.time() - start_time
+        if cleaned_text.strip():
+            try:
+                log(f"LLM processing new text chunk ({active_recog.name}): '{cleaned_text}'")
+                result = split_sentences_with_llm(last_sent_text, last_sent_text + new_text)
+                result = result.strip()
+                if result:
+                    log(f"[LLM] Finalized: {result}")
+                    text_processing_queue.put(result)
+                    last_sent_text += cleaned_text
+                last_send_time = now  # обновляем время отправки только если отправили
+            except Exception as e:
+                log(f"LLM error: {e}")
+
+        elapsed = time.time() - start_time_global
         if not switched_to_recog2 and elapsed > 30:
+            log(f"Switching recognition from {recog1.name} to {recog2.name}")
+
+            with recog1.text_lock, recog2.text_lock:
+                suffix = recog1.full_text[-3000:]
+                prefix = recog2.full_text[:3000]
+                cut_len = longest_common_suffix_prefix(suffix, prefix)
+                if cut_len > 0:
+                    log(f"Trimming {cut_len} chars prefix from {recog2.name}")
+                    recog2.trim_prefix(cut_len)
+
+            active_recog = recog2
+            switched_to_recog2 = True
             with recog2.text_lock:
-                if recog2.full_text:  # Wait for recog2 to have at least one final result
-                    recog2_ready = True
-            if recog2_ready:
-                log(f"Switching recognition from {recog1.name} to {recog2.name} at chunk {recog1.chunk_index}")
-                with recog1.text_lock, recog2.text_lock:
-                    recog2.chunk_index = recog1.chunk_index  # Sync chunk index
-                active_recog = recog2
-                switched_to_recog2 = True
+                last_sent_text = recog2.full_text
 
-        if DEBUG_MODE and elapsed > 60 and recog_debug:
-            log("Debug mode: Outputting all recognized texts after 60 seconds")
-            with recog1.text_lock, recog2.text_lock, recog_debug.text_lock:
-                text1 = "".join(recog1.full_text)
-                text2 = "".join(recog2.full_text)
-                text_debug = "".join(recog_debug.full_text)
-                log(f"RecognitionThread-1 (last chunk {recog1.chunk_index}): {text1[:1000]}...")
-                log(f"RecognitionThread-2 (last chunk {recog2.chunk_index}): {text2[:1000]}...")
-                log(f"RecognitionThread-Debug (last chunk {recog_debug.chunk_index}): {text_debug[:1000]}...")
-            break
 
+
+# --- Сбор аудио чанков из очереди ---
 def audio_chunks_collector(stop_flag, audio_chunks):
     while not stop_flag.is_set():
         try:
@@ -268,19 +319,6 @@ def audio_chunks_collector(stop_flag, audio_chunks):
             audio_queue.task_done()
         except queue.Empty:
             continue
-
-def start_recognition_thread_with_collector(name, audio_chunks, chunk_index, debug_mode=False):
-    stop_flag = threading.Event()
-    collector_thread = threading.Thread(target=audio_chunks_collector, args=(stop_flag, audio_chunks), daemon=True)
-    collector_thread.start()
-    recog_thread = RecognitionThread(audio_chunks, chunk_index, name, debug_mode=debug_mode)
-    recog_thread.start()
-    return recog_thread, stop_flag, collector_thread
-
-def stop_recognition_thread(recog_thread, stop_flag, collector_thread):
-    stop_flag.set()
-    collector_thread.join()
-    recog_thread.stop()
 
 def audio_capture_worker(stream):
     log("Audio capture started")
@@ -292,12 +330,35 @@ def audio_capture_worker(stream):
             log(f"Audio capture error: {e}")
             break
 
+def start_recognition_thread_with_collector(name):
+    audio_chunks = []
+    stop_flag = threading.Event()
+
+    collector_thread = threading.Thread(target=audio_chunks_collector, args=(stop_flag, audio_chunks), daemon=True)
+    collector_thread.start()
+
+    recog_thread = RecognitionThread(audio_queue, name)
+    recog_thread.audio_chunks = audio_chunks
+    recog_thread.stop_flag = stop_flag
+    recog_thread.thread = threading.Thread(target=recog_thread.worker, daemon=True)
+
+    recog_thread.start()
+
+    return recog_thread, stop_flag, collector_thread
+
+def stop_recognition_thread(recog_thread, stop_flag, collector_thread):
+    stop_flag.set()
+    collector_thread.join()
+    recog_thread.stop()
+
 def main():
+    global start_time_global
+
     p = pyaudio.PyAudio()
     stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
-    log("Starting live translation with final results...")
+    log("Starting live translation with LLM segmentation...")
 
-    audio_capture_thread = threading.Thread(target=lambda: audio_capture_worker(stream), daemon=True)
+    audio_capture_thread = threading.Thread(target=audio_capture_worker, args=(stream,), daemon=True)
     audio_capture_thread.start()
 
     playback_thread = threading.Thread(target=playback_worker, daemon=True)
@@ -306,32 +367,37 @@ def main():
     text_thread = threading.Thread(target=text_processing_worker, daemon=True)
     text_thread.start()
 
-    shared_audio_chunks = []
-    recog1, stop_flag1, collector1 = start_recognition_thread_with_collector("RecognitionThread-1", shared_audio_chunks, 0, debug_mode=True)
-    time.sleep(20)  # Allow recog1 to process initial audio
-    recog2, stop_flag2, collector2 = start_recognition_thread_with_collector("RecognitionThread-2", shared_audio_chunks, recog1.chunk_index, debug_mode=True)
-    recog_debug, stop_flag_debug, collector_debug = start_recognition_thread_with_collector("RecognitionThread-Debug", shared_audio_chunks, 0, debug_mode=True)
-    log("Debug mode: Started RecognitionThread-Debug")
+    # Запуск двух RecognitionThread с задержкой 20 секунд
+    recog1, stop_flag1, collector1 = start_recognition_thread_with_collector("RecognitionThread-1")
+    time.sleep(20)
+    recog2, stop_flag2, collector2 = start_recognition_thread_with_collector("RecognitionThread-2")
 
-    text_buffer_thread = threading.Thread(target=process_text_buffer, args=(recog1, recog2, recog_debug), daemon=True)
-    text_buffer_thread.start()
+    start_time_global = time.time()
+
+    # Запуск обработки LLM с переключением потоков
+    llm_thread = threading.Thread(target=process_llm_buffer_dual, args=(recog1, recog2), daemon=True)
+    llm_thread.start()
 
     try:
-        start_time = time.time()
+        # Останавливаем первый поток через 30 секунд после запуска второго
+        # Основной цикл просто ждет, потом останавливает потоки
         while True:
-            elapsed = time.time() - start_time
+            elapsed = time.time() - start_time_global
             if elapsed > 50:
-                if not stop_flag1.is_set():
+                # Останавливаем первый поток
+                if stop_flag1.is_set() is False:
                     log("Stopping RecognitionThread-1 after 50 seconds")
-                    stop_recognition_thread(recog1, stop_flag1, collector1)
+                    stop_flag1.set()
+                    collector1.join()
+                    recog1.stop()
+                # Останавливаем второй поток спустя ещё 30 сек (на всякий случай)
                 if elapsed > 80:
-                    if not stop_flag2.is_set():
+                    if stop_flag2.is_set() is False:
                         log("Stopping RecognitionThread-2 after 80 seconds")
-                        stop_recognition_thread(recog2, stop_flag2, collector2)
-                    if DEBUG_MODE and not stop_flag_debug.is_set():
-                        log("Stopping RecognitionThread-Debug after 80 seconds")
-                        stop_recognition_thread(recog_debug, stop_flag_debug, collector_debug)
-                    break
+                        stop_flag2.set()
+                        collector2.join()
+                        recog2.stop()
+                        break
             time.sleep(1)
     except KeyboardInterrupt:
         log("Stopping program with Ctrl+C...")
@@ -347,11 +413,13 @@ def main():
         text_thread.join()
 
         if not stop_flag1.is_set():
-            stop_recognition_thread(recog1, stop_flag1, collector1)
+            stop_flag1.set()
+            collector1.join()
+            recog1.stop()
         if not stop_flag2.is_set():
-            stop_recognition_thread(recog2, stop_flag2, collector2)
-        if DEBUG_MODE and not stop_flag_debug.is_set():
-            stop_recognition_thread(recog_debug, stop_flag_debug, collector_debug)
+            stop_flag2.set()
+            collector2.join()
+            recog2.stop()
 
 if __name__ == "__main__":
     main()
